@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport"
+          content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="ie=edge">
+    <title>Document</title>
+</head>
+<body>
+<script>
+
+    // straight up from DR!FT App
+    const DRIFT_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E".toLowerCase();
+    const DRIFT_DFU_SERVICE_UUID = "0000fe59-0000-1000-8000-00805f9b34fb";
+    const DRIFT_DFU_CHARACTERISTIC_UID = "8ec90001-f315-4f60-9fb8-838830daea50";
+    const DRIFT_CHARACTERISTIC_UID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E".toLowerCase();
+    const DRIFT_CHARACTERISTIC_TX_UID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+
+    const FETCH_FIRMWARE = [191, 6, 0, 8, 76, 0, 70, 205, 0, 0, 161];
+    const ACTIVATE_BOOTLOADER = [191, 6, 0, 8, 76, 0, 70, 205, 0, 0, 161];
+
+    const MAX_ANGLE = 180;
+    const MAX_ANGULAR_VELOCITY = 1700;
+    const MAX_VEL_KMH = 250;
+
+    function CalcDataFormatAngle(currentAngle) {
+        return (currentAngle / MAX_ANGLE * 32767);
+    }
+
+    function CalcDataFormatAngularVelocity(currentValDegreePerSecond) {
+        return (currentValDegreePerSecond / MAX_ANGULAR_VELOCITY * 32767);
+    }
+
+    // Patches
+    DataView.fromArray = function (array) {
+        const data = new DataView(new ArrayBuffer(array.length));
+        array.forEach((byte, index) => data.setUint8(index, byte));
+        return data;
+    };
+
+    DataView.prototype.toArray = function () {
+        return new Array(this.byteLength).fill(true).map((_, index) => this.getUint8(index));
+    };
+
+    Math.clamp = function (value, min, max) {
+        return Math.min(Math.max(value, min), max);
+    };
+
+    Math.dot = (a, b) => a.map((x, i) => a[i] * b[i]).reduce((m, n) => m + n);
+
+
+
+    const crc8 = (data, dataLength) => {
+        let b = 255;
+        for (let b2 = 0; b2 < dataLength; b2 = (b2 + 1)) {
+            b = (b ^ data[b2]);
+            for (let b3 = 8; b3 > 0; b3 = (b3 - 1)) {
+                b = (((b & 0x80) === 0) ? ((b << 1)) : (((b << 1) ^ 0x131)));
+            }
+        }
+        return b;
+    };
+
+    // let transferIndex = 0;
+    const drivePacket = (magnitude, angle, velocity, breakLight = false, headLight = false) => {
+        const data = new DataView(new ArrayBuffer(10));
+        data.setInt16(0, magnitude, true);
+        data.setInt16(2, angle, true);
+        data.setInt16(4, velocity, true);
+
+        let flags = 0b00;
+        if (breakLight) flags = 0b10;
+        if (headLight) flags |= 0b01;
+        data.setUint8(6, flags);
+
+        // data.setInt16(8, transferIndex++);
+        // if (transferIndex > 10000) transferIndex = 0;
+
+        return data;
+    };
+
+    const mapping = {
+        buttons: {
+            "button_1": 0,
+            "button_2": 1,
+            "button_3": 2,
+            "button_4": 3,
+            "shoulder_top_left": 4,
+            "shoulder_top_right": 5,
+            "shoulder_bottom_left": 6,
+            "shoulder_bottom_right": 7,
+            "select": 8,
+            "start": 9,
+            "stick_button_left": 10,
+            "stick_button_right": 11,
+            "d_pad_up": 12,
+            "d_pad_down": 13,
+            "d_pad_left": 14,
+            "d_pad_right": 15,
+            "vendor": 16
+        },
+        axes: {
+            "stick_axis_left": [0, 1],
+            "stick_axis_right": [2, 3]
+        },
+    };
+
+    const shittyControllerInterface = (index = 0, options = {deadZone: 0.21}) => {
+        navigator.getGamepads();
+        const events = new EventTarget();
+
+        let lastButtonStates = [];
+        let lastAxes = [];
+
+        function updateInputs() {
+            const gamepad = navigator.getGamepads()[index];
+            if (!gamepad) return;
+
+            gamepad.buttons.forEach(({value, pressed}, index) => {
+                if (!lastButtonStates[index] || lastButtonStates[index].value === value) return;
+
+                const name = Object.entries(mapping.buttons).find(([_, id]) => id === index)[0];
+
+                const event = new Event(name);
+                event.value = value;
+                event.pressed = pressed;
+                events.dispatchEvent(event);
+            });
+
+            lastButtonStates = gamepad.buttons;
+
+            gamepad.axes.forEach((value, index) => {
+                if (!lastAxes[index]) return;
+
+                const name = Object.entries(mapping.axes).find(([_, ids]) => ids.includes(index))[0];
+
+                if (Math.abs(value) <= options.deadZone) gamepad.axes[index] = 0;
+
+                const axis = (index) => index % 2 ? "x" : "y";
+                const otherIndex = index + ((index % 2) === 1 ? -1 : 1);
+
+                const event = new Event(name);
+                event.value = {
+                    [axis(index)]: value,
+                    [axis(otherIndex)]: lastAxes[otherIndex]
+                };
+                events.dispatchEvent(event);
+            });
+
+            lastAxes = gamepad.axes;
+        }
+
+        return {events, updateInputs};
+    };
+
+    const gamepad = shittyControllerInterface(0);
+
+    let angle = 0;
+    let velocity = {x: 0, y: 0};
+    let magnitude = 0;
+    let headLight = false;
+    let breakLight = false;
+
+    gamepad.events.addEventListener("button_1", (event) => {
+        if (event.pressed) headLight = !headLight;
+    });
+    gamepad.events.addEventListener("stick_axis_right", (event) => {
+        // angle = Math.atan2(event.value.y, Math.abs(event.value.x) * 0.7) * 180 / Math.PI;
+        // angle = Math.atan2(event.value.x, 0.01) * 180 / Math.PI;
+    });
+    gamepad.events.addEventListener("stick_axis_left", (event) => {
+        velocity = event.value;
+    });
+    gamepad.events.addEventListener("shoulder_bottom_right", (event) => {
+        magnitude = event.value;
+    });
+    gamepad.events.addEventListener("shoulder_bottom_left", (event) => {
+        magnitude = -event.value;
+        breakLight = event.value > 0.2;
+    });
+
+    const start = async () => {
+        await navigator.bluetooth.requestDevice({
+            filters: [{
+                services: [
+                    DRIFT_SERVICE_UUID
+                ]
+            }]
+        }).then(async (device) => {
+            console.log(device);
+            console.log(await device.gatt.connect());
+
+            const uartService = await device.gatt.getPrimaryService(DRIFT_SERVICE_UUID);
+            console.log(uartService);
+
+            const reader = await uartService.getCharacteristic(DRIFT_CHARACTERISTIC_TX_UID);
+            const writer = await uartService.getCharacteristic(DRIFT_CHARACTERISTIC_UID);
+
+            // const SendToPU = (values, messageId) => {
+            //     const array = new Uint8Array(values.length + 5);
+            //     array[0] = 35;
+            //     array[1] = values.length;
+            //     array[2] = 0;
+            //     array[3] = messageId;
+            //     for (let i = 0; i < values.length; i++) {
+            //         array[4 + i] = values[i];
+            //     }
+            //     array[values.length + 4] = crc8(array, (array.length - 1));
+            // };
+
+            const SendDriveData = async (data) => {
+                const driveData = DataView.fromArray([191, 10, 0, 8, 40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+                for (let i = 0; i < 8; i++) {
+                    driveData.setUint8(i + 6, data.getUint8(i));
+                }
+
+                driveData.setInt8(14, crc8(driveData.toArray(), 14));
+
+                console.log(driveData.toArray());
+                await writer.writeValueWithoutResponse(driveData);
+            };
+
+            console.log("read", reader);
+            console.log("write", writer);
+
+            await reader.startNotifications();
+
+            reader.addEventListener("characteristicvaluechanged", (e) => {
+                const data = e.target.value;
+                // console.log("received", new Array(data.byteLength).fill(true).map((_, index) => data.getUint8(index)));
+            });
+
+            await new Promise((resolve) => setTimeout(resolve, 200));
+
+            let lastSend = new Date().valueOf();
+            let lastPacket;
+
+            const update = async () => {
+                const now = new Date().valueOf();
+
+                // @TODO: read input
+                gamepad.updateInputs();
+
+                console.log(magnitude, angle, velocity);
+                const velocityAngle = CalcDataFormatAngle(Math.clamp(angle, 0 - MAX_ANGLE, MAX_ANGLE));
+                let angularVelocity = Math.dot([velocity.x, velocity.y], [0, 1]) * 120;
+                angularVelocity = CalcDataFormatAngularVelocity(Math.clamp(angularVelocity, 0 - MAX_ANGULAR_VELOCITY, MAX_ANGULAR_VELOCITY));
+                const velocityMagnitude = Math.round(32767 * magnitude / 2);
+
+                console.log(velocityMagnitude.toFixed(2), velocityAngle.toFixed(2), angularVelocity.toFixed(2));
+                lastPacket = drivePacket(velocityMagnitude, velocityAngle, angularVelocity, headLight, breakLight);
+
+                if (now - lastSend >= 100) {
+                    lastSend = now;
+
+                    await SendDriveData(lastPacket);
+                }
+
+                requestAnimationFrame(update);
+            };
+
+            requestAnimationFrame(update);
+        });
+    };
+</script>
+<a onclick="start()" style="cursor: pointer">
+    start
+</a>
+</body>
+</html>
